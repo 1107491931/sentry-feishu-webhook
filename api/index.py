@@ -2,87 +2,78 @@ from flask import Flask, request, jsonify
 import requests
 import json
 import os
-import hmac
-import hashlib
+from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
 
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
-SENTRY_CLIENT_SECRET = os.environ.get("SENTRY_CLIENT_SECRET", "")
+SENTRY_API_TOKEN = os.environ.get("SENTRY_API_TOKEN", "")
+SENTRY_BASE_URL = os.environ.get("SENTRY_BASE_URL", "https://sentry-us.addx.live")
+SENTRY_ORG = os.environ.get("SENTRY_ORG", "sentry")
+SENTRY_PROJECT = os.environ.get("SENTRY_PROJECT", "vh-ios")
+CRON_SECRET = os.environ.get("CRON_SECRET", "")
+CHECK_HOURS = int(os.environ.get("CHECK_HOURS", "1"))
 
 
-def verify_sentry_signature(payload, signature):
-    if not SENTRY_CLIENT_SECRET:
-        return True
-    expected = hmac.new(
-        SENTRY_CLIENT_SECRET.encode("utf-8"), payload, hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature)
+def sentry_headers():
+    return {"Authorization": f"Bearer {SENTRY_API_TOKEN}"}
 
 
-def build_feishu_card(data, resource, action):
-    if resource == "issue" and action == "created":
-        issue = data.get("data", {}).get("issue", {})
-        title = issue.get("title", "Unknown Issue")
-        culprit = issue.get("culprit", "")
-        url = issue.get("url", "")
-        project = data.get("data", {}).get("project", {}).get("name", "Unknown")
-        release = issue.get("firstRelease", {})
-        release_version = release.get("version", "Unknown") if release else "Unknown"
+def get_latest_releases(limit=2):
+    url = f"{SENTRY_BASE_URL}/api/0/projects/{SENTRY_ORG}/{SENTRY_PROJECT}/releases/"
+    resp = requests.get(url, headers=sentry_headers(), params={"per_page": limit}, timeout=8)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_new_issues_for_release(release_version, since_hours=1):
+    """Get issues first seen in this release within the last N hours."""
+    url = f"{SENTRY_BASE_URL}/api/0/projects/{SENTRY_ORG}/{SENTRY_PROJECT}/issues/"
+    since = (datetime.now(timezone.utc) - timedelta(hours=since_hours)).strftime("%Y-%m-%dT%H:%M:%S")
+    params = {
+        "query": f"firstRelease:{release_version} firstSeen:>{since}",
+        "sort": "date",
+        "per_page": 25,
+    }
+    resp = requests.get(url, headers=sentry_headers(), params=params, timeout=8)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def build_issues_card(issues, release_version, project):
+    """Build Feishu card for a batch of new issues."""
+    issue_lines = []
+    for i, issue in enumerate(issues[:10], 1):
+        title = issue.get("title", "Unknown")
         level = issue.get("level", "error")
-        first_seen = issue.get("firstSeen", "")
-        level_color = "red" if level in ("error", "fatal") else "orange"
+        url = issue.get("permalink", "")
+        culprit = issue.get("culprit", "")
+        line = f"{i}. **[{level.upper()}]** [{title}]({url})"
+        if culprit:
+            line += f"\n    `{culprit}`"
+        issue_lines.append(line)
 
-        return {
-            "msg_type": "interactive",
-            "card": {
-                "header": {
-                    "title": {"tag": "plain_text", "content": f"Sentry New Issue [{level.upper()}]"},
-                    "template": level_color,
-                },
-                "elements": [
-                    {
-                        "tag": "div",
-                        "fields": [
-                            {"is_short": True, "text": {"tag": "lark_md", "content": f"**Project:**\n{project}"}},
-                            {"is_short": True, "text": {"tag": "lark_md", "content": f"**Level:**\n{level.upper()}"}},
-                            {"is_short": True, "text": {"tag": "lark_md", "content": f"**Release:**\n{release_version}"}},
-                            {"is_short": True, "text": {"tag": "lark_md", "content": f"**First Seen:**\n{first_seen}"}},
-                        ],
-                    },
-                    {"tag": "div", "text": {"tag": "lark_md", "content": f"**Error:**\n{title}"}},
-                    {"tag": "div", "text": {"tag": "lark_md", "content": f"**Location:**\n{culprit}"}},
-                    {"tag": "hr"},
-                    {
-                        "tag": "action",
-                        "actions": [
-                            {
-                                "tag": "button",
-                                "text": {"tag": "plain_text", "content": "View in Sentry"},
-                                "url": url,
-                                "type": "primary",
-                            }
-                        ],
-                    },
-                ],
-            },
-        }
+    remaining = len(issues) - 10
+    if remaining > 0:
+        issue_lines.append(f"\n... and {remaining} more issues")
 
     return {
         "msg_type": "interactive",
         "card": {
             "header": {
-                "title": {"tag": "plain_text", "content": f"Sentry Event: {resource} {action}"},
-                "template": "blue",
+                "title": {"tag": "plain_text", "content": f"Sentry: {len(issues)} New Issues Found"},
+                "template": "red",
             },
             "elements": [
                 {
                     "tag": "div",
-                    "text": {
-                        "tag": "lark_md",
-                        "content": f"```json\n{json.dumps(data, indent=2, ensure_ascii=False)[:2000]}\n```",
-                    },
-                }
+                    "fields": [
+                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**Project:**\n{project}"}},
+                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**Release:**\n{release_version}"}},
+                    ],
+                },
+                {"tag": "hr"},
+                {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(issue_lines)}},
             ],
         },
     }
@@ -98,27 +89,45 @@ def health():
     return jsonify({"status": "ok", "service": "sentry-feishu-webhook"})
 
 
-@app.route("/webhook/sentry", methods=["POST"])
-def sentry_webhook():
-    signature = request.headers.get("Sentry-Hook-Signature", "")
-    if SENTRY_CLIENT_SECRET and not verify_sentry_signature(request.data, signature):
-        return jsonify({"error": "invalid signature"}), 401
+@app.route("/cron/check", methods=["GET"])
+def cron_check():
+    """Poll Sentry for new issues in the latest release and notify Feishu."""
+    # Verify cron secret
+    secret = request.args.get("secret", "")
+    if CRON_SECRET and secret != CRON_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
 
-    resource = request.headers.get("Sentry-Hook-Resource", "")
-    action = request.headers.get("Sentry-Hook-Action", "")
+    if not SENTRY_API_TOKEN:
+        return jsonify({"error": "SENTRY_API_TOKEN not configured"}), 500
 
-    if resource == "issue" and action != "created":
-        return jsonify({"msg": f"ignored: issue {action}"}), 200
+    if not FEISHU_WEBHOOK_URL:
+        return jsonify({"error": "FEISHU_WEBHOOK_URL not configured"}), 500
 
-    data = request.json
-    if not data:
-        return jsonify({"error": "empty body"}), 400
+    # Get latest releases
+    releases = get_latest_releases(2)
+    if not releases:
+        return jsonify({"msg": "no releases found"}), 200
 
-    card = build_feishu_card(data, resource, action)
+    latest_release = releases[0]["version"]
+
+    # Get new issues first seen in the latest release within the last CHECK_HOURS
+    # firstRelease filter ensures these issues did NOT exist in any previous release
+    new_issues = get_new_issues_for_release(latest_release, since_hours=CHECK_HOURS)
+
+    if not new_issues:
+        return jsonify({
+            "msg": "no new issues",
+            "release": latest_release,
+            "checked_hours": CHECK_HOURS,
+        }), 200
+
+    # Send to Feishu
+    card = build_issues_card(new_issues, latest_release, SENTRY_PROJECT)
     status_code, resp_text = send_to_feishu(card)
 
     return jsonify({
-        "msg": "forwarded to feishu",
+        "msg": f"found {len(new_issues)} new issues",
+        "release": latest_release,
         "feishu_status": status_code,
         "feishu_response": resp_text,
     }), 200
