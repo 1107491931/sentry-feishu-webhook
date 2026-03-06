@@ -12,7 +12,6 @@ SENTRY_CLIENT_SECRET = os.environ.get("SENTRY_CLIENT_SECRET", "")
 
 
 def verify_sentry_signature(payload, signature):
-    """Verify Sentry webhook signature if secret is configured."""
     if not SENTRY_CLIENT_SECRET:
         return True
     expected = hmac.new(
@@ -22,8 +21,6 @@ def verify_sentry_signature(payload, signature):
 
 
 def build_feishu_card(data, resource, action):
-    """Build Feishu interactive card message from Sentry webhook data."""
-
     if resource == "issue" and action == "created":
         issue = data.get("data", {}).get("issue", {})
         title = issue.get("title", "Unknown Issue")
@@ -34,10 +31,9 @@ def build_feishu_card(data, resource, action):
         release_version = release.get("version", "Unknown") if release else "Unknown"
         level = issue.get("level", "error")
         first_seen = issue.get("firstSeen", "")
-
         level_color = "red" if level in ("error", "fatal") else "orange"
 
-        card = {
+        return {
             "msg_type": "interactive",
             "card": {
                 "header": {
@@ -71,9 +67,7 @@ def build_feishu_card(data, resource, action):
                 ],
             },
         }
-        return card
 
-    # Fallback for other event types
     return {
         "msg_type": "interactive",
         "card": {
@@ -95,7 +89,6 @@ def build_feishu_card(data, resource, action):
 
 
 def send_to_feishu(card):
-    """Send message to Feishu webhook."""
     resp = requests.post(FEISHU_WEBHOOK_URL, json=card, timeout=10)
     return resp.status_code, resp.text
 
@@ -107,9 +100,6 @@ def health():
 
 @app.route("/webhook/sentry", methods=["POST"])
 def sentry_webhook():
-    """Receive Sentry webhook and forward to Feishu."""
-
-    # Verify signature
     signature = request.headers.get("Sentry-Hook-Signature", "")
     if SENTRY_CLIENT_SECRET and not verify_sentry_signature(request.data, signature):
         return jsonify({"error": "invalid signature"}), 401
@@ -117,7 +107,6 @@ def sentry_webhook():
     resource = request.headers.get("Sentry-Hook-Resource", "")
     action = request.headers.get("Sentry-Hook-Action", "")
 
-    # Only forward new issues (ignore existing issues from old versions)
     if resource == "issue" and action != "created":
         return jsonify({"msg": f"ignored: issue {action}"}), 200
 
@@ -133,8 +122,3 @@ def sentry_webhook():
         "feishu_status": status_code,
         "feishu_response": resp_text,
     }), 200
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
